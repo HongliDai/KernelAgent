@@ -14,6 +14,7 @@
 
 """OpenAI provider implementation."""
 
+import os
 from .openai_base import OpenAICompatibleProvider
 
 
@@ -21,7 +22,12 @@ class OpenAIProvider(OpenAICompatibleProvider):
     """OpenAI API provider."""
 
     def __init__(self):
-        super().__init__(api_key_env="OPENAI_API_KEY")
+        custom_base_url = os.environ.get("OPENAI_BASE_URL")
+
+        super().__init__(
+            api_key_env="OPENAI_API_KEY",
+            base_url=custom_base_url
+        )
 
     @property
     def name(self) -> str:

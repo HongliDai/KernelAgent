@@ -196,7 +196,9 @@ class TritonKernelUI:
                 kernel_code = result["kernel_code"]
 
                 # Read the generated test code
-                test_file_path = os.path.join(result["session_dir"], "test.py")
+                test_file_path = os.path.join(result["session_dir"], "test_0.py")
+                if not os.path.exists(test_file_path):
+                    test_file_path = os.path.join(result["session_dir"], "test.py")
                 try:
                     with open(test_file_path, "r") as f:
                         generated_test = f.read()

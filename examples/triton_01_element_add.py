@@ -103,7 +103,9 @@ def get_init_inputs():
         # Read the generated test code
         import os
 
-        test_file = os.path.join(result["session_dir"], "test.py")
+        test_file = os.path.join(result["session_dir"], "test_0.py")
+        if not os.path.exists(test_file):
+            test_file = os.path.join(result["session_dir"], "test.py")
         with open(test_file, "r") as f:
             test_code = f.read()
 
