@@ -42,6 +42,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import time
 import textwrap
 from dataclasses import dataclass
 from pathlib import Path
@@ -66,6 +67,7 @@ from .code_extractor import extract_single_python_file
 
 # Reuse Fuser runner for optional verification
 from .runner import run_candidate
+from .lightweight_profiler import get_profiler_from_env, extract_usage_tokens
 
 
 @dataclass
@@ -365,6 +367,7 @@ def compose(
     last_usage = None
     last_code = None
     verify_info: dict[str, Any] = {}
+    profiler = get_profiler_from_env()
 
     for i in range(1, max_iters + 1):
         if i == 1 or last_code is None:
@@ -404,10 +407,35 @@ def compose(
             )
 
         (attempts_dir / f"attempt_{i}.prompt.txt").write_text(prompt, encoding="utf-8")
+        llm_t0 = time.time()
+        llm_start = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(llm_t0))
         response = provider.get_response(
             model_name, [{"role": "user", "content": prompt}], max_tokens=50000
         )
+        llm_t1 = time.time()
+        llm_end = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(llm_t1))
         last_usage = response.usage
+        if profiler:
+            p_tok, c_tok, t_tok = extract_usage_tokens(response.usage)
+            profiler.emit(
+                {
+                    "event_type": "llm_request",
+                    "stage_name": "compose.llm",
+                    "worker_id": None,
+                    "iteration_id": str(i),
+                    "model_name": model_name,
+                    "request_start_ts": llm_start,
+                    "request_end_ts": llm_end,
+                    "llm_latency_ms": round((llm_t1 - llm_t0) * 1000.0, 3),
+                    "prompt_tokens": p_tok,
+                    "completion_tokens": c_tok,
+                    "total_tokens": t_tok,
+                    "success": True,
+                    "error_type": None,
+                    "provider_name": provider.name,
+                    "provider_supports_usage": response.usage is not None,
+                }
+            )
         raw_text = response.content or ""
 
         # Extract code
@@ -420,6 +448,7 @@ def compose(
 
         # Verify each attempt if requested
         if verify:
+            vt0 = time.time()
             rr = run_candidate(
                 artifacts_code_path=attempts_dir / f"attempt_{i}.py",
                 run_root=out_dir / "runs",
@@ -427,6 +456,7 @@ def compose(
                 isolated=False,
                 deny_network=False,
             )
+            vt1 = time.time()
             verify_info = {
                 "verify_rc": rr.rc,
                 "verify_passed": rr.passed,
@@ -435,6 +465,23 @@ def compose(
                 "stdout_path": str(rr.stdout_path),
                 "stderr_path": str(rr.stderr_path),
             }
+            if profiler:
+                profiler.emit(
+                    {
+                        "event_type": "local_exec",
+                        "stage_name": "final_verify",
+                        "worker_id": None,
+                        "iteration_id": str(i),
+                        "local_exec_start_ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(vt0)),
+                        "local_exec_end_ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(vt1)),
+                        "local_exec_latency_ms": round((vt1 - vt0) * 1000.0, 3),
+                        "verify_latency_ms": round((vt1 - vt0) * 1000.0, 3),
+                        "subprocess_exit_code": rr.rc,
+                        "timeout_flag": (rr.rc == -9) or ("timed out" in rr.reason.lower()),
+                        "success": rr.passed,
+                        "error_type": None if rr.passed else rr.reason,
+                    }
+                )
             if rr.passed:
                 break
         else:

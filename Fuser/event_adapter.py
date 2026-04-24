@@ -127,6 +127,7 @@ class EventAdapter:
         output_text_parts: list[str] = []
         response_id: str | None = None
         error_msg: str | None = None
+        usage: dict[str, Any] | None = None
 
         # Start background flusher
         done_flag = threading.Event()
@@ -213,6 +214,24 @@ class EventAdapter:
                             pass
 
                     self._append_event(StreamDelta(time.time(), kind, data))
+                # Best-effort final response metadata (usage / id)
+                try:
+                    final_resp = stream.get_final_response()
+                    if final_resp is not None:
+                        usage_obj = getattr(final_resp, "usage", None)
+                        if usage_obj is not None:
+                            if hasattr(usage_obj, "model_dump"):
+                                usage = usage_obj.model_dump()  # type: ignore[assignment]
+                            elif hasattr(usage_obj, "dict"):
+                                usage = usage_obj.dict()  # type: ignore[assignment]
+                            elif isinstance(usage_obj, dict):
+                                usage = usage_obj
+                        if response_id is None:
+                            rid = getattr(final_resp, "id", None)
+                            if isinstance(rid, str):
+                                response_id = rid
+                except Exception:
+                    pass
         except Exception as e:
             error_msg = f"stream_error: {e.__class__.__name__}: {e}"
             self._append_event(
@@ -228,4 +247,6 @@ class EventAdapter:
             "output_text": "".join(output_text_parts),
             "response_id": response_id,
             "error": error_msg,
+            "usage": usage,
+            "provider": "openai",
         }

@@ -14,6 +14,7 @@
 from __future__ import annotations
 import json
 import queue
+import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Callable
@@ -25,6 +26,7 @@ from .code_extractor import extract_single_python_file, sha256_of_code
 from .runner import run_candidate
 from .logging_utils import setup_file_logger
 from .dedup import register_digest
+from .lightweight_profiler import get_profiler_from_env, extract_usage_tokens
 
 from utils.providers import get_model_provider
 
@@ -90,6 +92,7 @@ class Worker:
         self.dirs = _ensure_dirs(cfg.workspace_dir)
 
     def run(self) -> None:
+        profiler = get_profiler_from_env()
         state = WorkerState(
             worker_id=self.cfg.worker_id,
             iter_index=0,
@@ -132,22 +135,73 @@ class Worker:
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": rp.user},
                 ]
+                llm_t0 = time.time()
+                llm_start_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(llm_t0))
                 try:
                     response = provider.get_response(
                         self.cfg.model, messages, max_tokens=16000, **rp.extras
                     )
+                    llm_t1 = time.time()
+                    llm_end_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(llm_t1))
+                    p_tok, c_tok, t_tok = extract_usage_tokens(response.usage)
                     result = {
                         "output_text": response.content or "",
                         "response_id": response.response_id or None,
                         "error": None,
+                        "usage": response.usage,
+                        "provider": provider.name,
                     }
+                    if profiler:
+                        profiler.emit(
+                            {
+                                "event_type": "llm_request",
+                                "stage_name": "extract.worker.llm",
+                                "worker_id": self.cfg.worker_id,
+                                "iteration_id": str(k),
+                                "model_name": self.cfg.model,
+                                "request_start_ts": llm_start_iso,
+                                "request_end_ts": llm_end_iso,
+                                "llm_latency_ms": round((llm_t1 - llm_t0) * 1000.0, 3),
+                                "prompt_tokens": p_tok,
+                                "completion_tokens": c_tok,
+                                "total_tokens": t_tok,
+                                "success": True,
+                                "error_type": None,
+                                "provider_name": provider.name,
+                                "provider_supports_usage": response.usage is not None,
+                            }
+                        )
                 except Exception as e:
+                    llm_t1 = time.time()
+                    llm_end_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(llm_t1))
                     error = f"stream_error: {e.__class__.__name__}: {e}"
                     result = {
                         "output_text": "",
                         "response_id": None,
                         "error": error,
+                        "usage": None,
+                        "provider": provider.name,
                     }
+                    if profiler:
+                        profiler.emit(
+                            {
+                                "event_type": "llm_request",
+                                "stage_name": "extract.worker.llm",
+                                "worker_id": self.cfg.worker_id,
+                                "iteration_id": str(k),
+                                "model_name": self.cfg.model,
+                                "request_start_ts": llm_start_iso,
+                                "request_end_ts": llm_end_iso,
+                                "llm_latency_ms": round((llm_t1 - llm_t0) * 1000.0, 3),
+                                "prompt_tokens": None,
+                                "completion_tokens": None,
+                                "total_tokens": None,
+                                "success": False,
+                                "error_type": e.__class__.__name__,
+                                "provider_name": provider.name,
+                                "provider_supports_usage": False,
+                            }
+                        )
             else:
                 # Stream via EventAdapter
                 jsonl_path = self.dirs["responses"] / f"iteration_{k}.stream.jsonl"
@@ -159,9 +213,35 @@ class Worker:
                     stop_event=self.cancel_event,
                     on_delta=self.on_delta,
                 )
+                llm_t0 = time.time()
+                llm_start_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(llm_t0))
                 result = adapter.stream(
                     system_prompt=SYSTEM_PROMPT, user_prompt=rp.user, extras=rp.extras
                 )
+                llm_t1 = time.time()
+                llm_end_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(llm_t1))
+                usage = result.get("usage") if isinstance(result, dict) else None
+                p_tok, c_tok, t_tok = extract_usage_tokens(usage if isinstance(usage, dict) else None)
+                if profiler:
+                    profiler.emit(
+                        {
+                            "event_type": "llm_request",
+                            "stage_name": "extract.worker.llm",
+                            "worker_id": self.cfg.worker_id,
+                            "iteration_id": str(k),
+                            "model_name": self.cfg.model,
+                            "request_start_ts": llm_start_iso,
+                            "request_end_ts": llm_end_iso,
+                            "llm_latency_ms": round((llm_t1 - llm_t0) * 1000.0, 3),
+                            "prompt_tokens": p_tok,
+                            "completion_tokens": c_tok,
+                            "total_tokens": t_tok,
+                            "success": not bool(result.get("error")),
+                            "error_type": result.get("error"),
+                            "provider_name": "openai",
+                            "provider_supports_usage": usage is not None,
+                        }
+                    )
 
             state.last_response_id = result.get("response_id")
             _write_json(
@@ -210,6 +290,28 @@ class Worker:
                 deny_network=self.cfg.deny_network,
                 cancel_event=self.cancel_event,
             )
+            if profiler:
+                timeout_flag = False
+                try:
+                    timeout_flag = (rr.rc == -9) or ("timed out" in rr.reason.lower())
+                except Exception:
+                    timeout_flag = False
+                profiler.emit(
+                    {
+                        "event_type": "local_exec",
+                        "stage_name": "extract.worker.verify",
+                        "worker_id": self.cfg.worker_id,
+                        "iteration_id": str(k),
+                        "local_exec_start_ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(rr.t_started)),
+                        "local_exec_end_ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(rr.t_finished)),
+                        "local_exec_latency_ms": round((rr.t_finished - rr.t_started) * 1000.0, 3),
+                        "verify_latency_ms": round((rr.t_finished - rr.t_started) * 1000.0, 3),
+                        "subprocess_exit_code": rr.rc,
+                        "timeout_flag": timeout_flag,
+                        "success": rr.passed,
+                        "error_type": None if rr.passed else rr.reason,
+                    }
+                )
 
             if rr.passed:
                 self.logger.info("PASS at iter %d via %s", k, rr.validator_used)

@@ -38,6 +38,7 @@ import argparse
 import json
 import os
 import textwrap
+import time
 from pathlib import Path
 from typing import Any
 import concurrent.futures as _futures
@@ -54,6 +55,7 @@ from triton_kernel_agent.platform_config import (
     get_platform_choices,
     PlatformConfig,
 )
+from .lightweight_profiler import get_profiler_from_env
 
 
 def _shape_list(shape: Any) -> list[str]:
@@ -345,6 +347,8 @@ def run(
         raise SystemExit(
             "TritonKernelAgent not available. Ensure the package is importable."
         )
+    profiler = get_profiler_from_env()
+    dispatch_t0 = time.time()
 
     with subgraphs_path.open("r", encoding="utf-8") as f:
         items: list[dict[str, Any]] = json.load(f)
@@ -360,6 +364,7 @@ def run(
     def _handle_one(idx_item: tuple[int, dict[str, Any]]) -> tuple[int, dict[str, Any]]:
         idx, item = idx_item
         sid = str(item.get("id", f"subgraph_{idx}"))
+        local_t0 = time.time()
         pdesc = _synthesize_problem_description(item, target_platform=platform)
         sg_dir = out_dir / sid
         sg_dir.mkdir(parents=True, exist_ok=True)
@@ -383,6 +388,21 @@ def run(
                 local_agent.cleanup()
             except Exception:
                 pass
+            if profiler:
+                local_t1 = time.time()
+                profiler.emit(
+                    {
+                        "event_type": "local_exec",
+                        "stage_name": "dispatch.subgraph",
+                        "worker_id": sid,
+                        "iteration_id": None,
+                        "local_exec_start_ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(local_t0)),
+                        "local_exec_end_ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(local_t1)),
+                        "local_exec_latency_ms": round((local_t1 - local_t0) * 1000.0, 3),
+                        "success": False,
+                        "error_type": exc.__class__.__name__,
+                    }
+                )
             return idx, {"id": sid, "success": False, "error": str(exc)}
 
         try:
@@ -393,6 +413,21 @@ def run(
         if result.get("success"):
             kernel_code = result.get("kernel_code", "")
             (sg_dir / "kernel.py").write_text(kernel_code, encoding="utf-8")
+            if profiler:
+                local_t1 = time.time()
+                profiler.emit(
+                    {
+                        "event_type": "local_exec",
+                        "stage_name": "dispatch.subgraph",
+                        "worker_id": sid,
+                        "iteration_id": None,
+                        "local_exec_start_ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(local_t0)),
+                        "local_exec_end_ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(local_t1)),
+                        "local_exec_latency_ms": round((local_t1 - local_t0) * 1000.0, 3),
+                        "success": True,
+                        "error_type": None,
+                    }
+                )
             return idx, {
                 "id": sid,
                 "success": True,
@@ -402,6 +437,21 @@ def run(
                 "kernel_path": str((sg_dir / "kernel.py").resolve()),
             }
         else:
+            if profiler:
+                local_t1 = time.time()
+                profiler.emit(
+                    {
+                        "event_type": "local_exec",
+                        "stage_name": "dispatch.subgraph",
+                        "worker_id": sid,
+                        "iteration_id": None,
+                        "local_exec_start_ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(local_t0)),
+                        "local_exec_end_ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(local_t1)),
+                        "local_exec_latency_ms": round((local_t1 - local_t0) * 1000.0, 3),
+                        "success": False,
+                        "error_type": result.get("message"),
+                    }
+                )
             return idx, {
                 "id": sid,
                 "success": False,
@@ -428,6 +478,20 @@ def run(
 
     # Preserve input order in summary output
     summary: list[dict[str, Any]] = [results[i] for i in sorted(results.keys())]
+    if profiler:
+        dispatch_t1 = time.time()
+        profiler.emit(
+            {
+                "event_type": "stage",
+                "stage_name": "dispatch",
+                "local_exec_start_ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(dispatch_t0)),
+                "local_exec_end_ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(dispatch_t1)),
+                "local_exec_latency_ms": round((dispatch_t1 - dispatch_t0) * 1000.0, 3),
+                "number_of_subgraphs": len(items),
+                "success": all(bool(s.get("success")) for s in summary),
+                "error_type": None,
+            }
+        )
     out_summary = out_dir / "summary.json"
     out_summary.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return out_summary

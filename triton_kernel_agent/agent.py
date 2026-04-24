@@ -17,6 +17,7 @@
 import os
 import json
 import re
+import time
 from pathlib import Path
 from typing import Any
 from datetime import datetime
@@ -28,6 +29,7 @@ from .prompt_manager import PromptManager
 from utils.providers import BaseProvider, get_model_provider
 from triton_kernel_agent.platform_config import PlatformConfig, get_platform
 from triton_kernel_agent.worker_util import format_test_code_for_llm
+from Fuser.lightweight_profiler import get_profiler_from_env, extract_usage_tokens
 
 
 class TritonKernelAgent:
@@ -245,7 +247,39 @@ class TritonKernelAgent:
 
                 # Call LLM API
                 messages = [{"role": "user", "content": prompt}]
-                response_text = self._call_llm(messages, max_tokens=24000)
+                profiler = get_profiler_from_env()
+                t0 = time.time()
+                req_start = datetime.utcfromtimestamp(t0).isoformat() + "Z"
+                response = self.provider.get_response(
+                    self.model_name,
+                    messages,
+                    max_tokens=24000,
+                    high_reasoning_effort=self.high_reasoning_effort,
+                )
+                t1 = time.time()
+                req_end = datetime.utcfromtimestamp(t1).isoformat() + "Z"
+                p_tok, c_tok, t_tok = extract_usage_tokens(response.usage)
+                if profiler:
+                    profiler.emit(
+                        {
+                            "event_type": "llm_request",
+                            "stage_name": "dispatch.test_generation",
+                            "worker_id": None,
+                            "iteration_id": None,
+                            "model_name": self.model_name,
+                            "request_start_ts": req_start,
+                            "request_end_ts": req_end,
+                            "llm_latency_ms": round((t1 - t0) * 1000.0, 3),
+                            "prompt_tokens": p_tok,
+                            "completion_tokens": c_tok,
+                            "total_tokens": t_tok,
+                            "success": True,
+                            "error_type": None,
+                            "provider_name": self.provider.name,
+                            "provider_supports_usage": response.usage is not None,
+                        }
+                    )
+                response_text = response.content
                 self.logger.info("Raw test generation response:\n%s", response_text)
 
                 # Extract test code from response
@@ -373,6 +407,8 @@ if __name__ == "__main__":
 
                 if self.provider.supports_multiple_completions():
                     # Provider supports native multiple completions
+                    t0 = time.time()
+                    req_start = datetime.utcfromtimestamp(t0).isoformat() + "Z"
                     responses = self.provider.get_multiple_responses(
                         self.model_name,
                         messages,
@@ -381,6 +417,31 @@ if __name__ == "__main__":
                         max_tokens=max_completion_tokens,
                         high_reasoning_effort=self.high_reasoning_effort,
                     )
+                    t1 = time.time()
+                    req_end = datetime.utcfromtimestamp(t1).isoformat() + "Z"
+                    profiler = get_profiler_from_env()
+                    if profiler:
+                        for i, response in enumerate(responses, start=1):
+                            p_tok, c_tok, t_tok = extract_usage_tokens(response.usage)
+                            profiler.emit(
+                                {
+                                    "event_type": "llm_request",
+                                    "stage_name": "dispatch.seed_generation",
+                                    "worker_id": None,
+                                    "iteration_id": str(i),
+                                    "model_name": self.model_name,
+                                    "request_start_ts": req_start,
+                                    "request_end_ts": req_end,
+                                    "llm_latency_ms": round((t1 - t0) * 1000.0, 3),
+                                    "prompt_tokens": p_tok,
+                                    "completion_tokens": c_tok,
+                                    "total_tokens": t_tok,
+                                    "success": True,
+                                    "error_type": None,
+                                    "provider_name": self.provider.name,
+                                    "provider_supports_usage": response.usage is not None,
+                                }
+                            )
 
                     for i, response in enumerate(responses):
                         kernel_code = self._extract_code_from_response(
@@ -396,11 +457,40 @@ if __name__ == "__main__":
                 else:
                     # Provider doesn't support multiple completions, make individual calls
                     for i in range(num_seeds):
-                        response_text = self._call_llm(
+                        profiler = get_profiler_from_env()
+                        t0 = time.time()
+                        req_start = datetime.utcfromtimestamp(t0).isoformat() + "Z"
+                        response = self.provider.get_response(
+                            self.model_name,
                             messages,
                             max_tokens=max_completion_tokens,
                             temperature=0.8 + (i * 0.1),
+                            high_reasoning_effort=self.high_reasoning_effort,
                         )
+                        t1 = time.time()
+                        req_end = datetime.utcfromtimestamp(t1).isoformat() + "Z"
+                        p_tok, c_tok, t_tok = extract_usage_tokens(response.usage)
+                        if profiler:
+                            profiler.emit(
+                                {
+                                    "event_type": "llm_request",
+                                    "stage_name": "dispatch.seed_generation",
+                                    "worker_id": None,
+                                    "iteration_id": str(i + 1),
+                                    "model_name": self.model_name,
+                                    "request_start_ts": req_start,
+                                    "request_end_ts": req_end,
+                                    "llm_latency_ms": round((t1 - t0) * 1000.0, 3),
+                                    "prompt_tokens": p_tok,
+                                    "completion_tokens": c_tok,
+                                    "total_tokens": t_tok,
+                                    "success": True,
+                                    "error_type": None,
+                                    "provider_name": self.provider.name,
+                                    "provider_supports_usage": response.usage is not None,
+                                }
+                            )
+                        response_text = response.content
                         kernel_code = self._extract_code_from_response(
                             response_text,
                             prefer_kernel_function=self._has_multiple_tests,

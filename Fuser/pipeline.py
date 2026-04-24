@@ -35,11 +35,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import time
 from pathlib import Path
 
 from .subgraph_extractor import extract_subgraphs_to_json
 from .dispatch_kernel_agent import run as dispatch_run
 from .compose_end_to_end import compose
+from .lightweight_profiler import LightweightProfiler
 from triton_kernel_agent.platform_config import get_platform_choices
 
 
@@ -58,7 +61,21 @@ def run_pipeline(
     compose_max_iters: int = 5,
     target_platform: str = "cuda",
     test_timeout_s: int = 30,
+    enable_profiler: bool = False,
+    profile_output_dir: Path | None = None,
+    profile_export_csv: bool = False,
 ) -> dict:
+    pipeline_t0 = time.time()
+    profiler = LightweightProfiler(
+        enabled=enable_profiler,
+        problem_path=str(problem_path),
+        target_platform=target_platform,
+        profile_output_dir=profile_output_dir,
+        export_csv=profile_export_csv,
+    )
+    if enable_profiler:
+        os.environ["KA_ENABLE_PROFILER"] = "1"
+
     # Select default KernelAgent model if not provided: prefer GPT-5 for Level 2/3
     if dispatch_model is None:
         pp = str(problem_path)
@@ -78,6 +95,7 @@ def run_pipeline(
             dispatch_model = "o4-mini"
 
     # Step 1: extract
+    extract_t0 = time.time()
     run_dir, subgraphs_path = extract_subgraphs_to_json(
         problem_path=problem_path,
         model_name=extract_model,
@@ -86,7 +104,22 @@ def run_pipeline(
         llm_timeout_s=llm_timeout_s,
         run_timeout_s=run_timeout_s,
         target_platform=target_platform,
+        profiler=profiler,
     )
+    extract_t1 = time.time()
+    if enable_profiler:
+        profiler.attach_run_dir(Path(run_dir))
+        profiler.export_env()
+        profiler.emit(
+            {
+                "event_type": "stage",
+                "stage_name": "extract.total",
+                "local_exec_start_ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(extract_t0)),
+                "local_exec_end_ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(extract_t1)),
+                "local_exec_latency_ms": round((extract_t1 - extract_t0) * 1000.0, 3),
+                "success": True,
+            }
+        )
 
     # Step 2: dispatch to KernelAgent
     out_dir = Path(run_dir) / "kernels_out"
@@ -106,6 +139,7 @@ def run_pipeline(
         except Exception:
             jobs_val = 1
 
+    dispatch_t0 = time.time()
     summary_path = dispatch_run(
         subgraphs_path=Path(subgraphs_path),
         out_dir=out_dir,
@@ -115,10 +149,23 @@ def run_pipeline(
         max_iters=max_iters,
         test_timeout_s=test_timeout_s,
     )
+    dispatch_t1 = time.time()
+    if enable_profiler:
+        profiler.emit(
+            {
+                "event_type": "stage",
+                "stage_name": "dispatch.total",
+                "local_exec_start_ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(dispatch_t0)),
+                "local_exec_end_ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(dispatch_t1)),
+                "local_exec_latency_ms": round((dispatch_t1 - dispatch_t0) * 1000.0, 3),
+                "success": True,
+            }
+        )
 
     # Step 3: compose end-to-end
     compose_out = Path(run_dir) / "compose_out"
     compose_out.mkdir(parents=True, exist_ok=True)
+    compose_t0 = time.time()
     comp_res = compose(
         problem_path=problem_path,
         subgraphs_path=Path(subgraphs_path),
@@ -129,12 +176,63 @@ def run_pipeline(
         max_iters=compose_max_iters,
         target_platform=target_platform,
     )
-    return {
+    compose_t1 = time.time()
+
+    result = {
         "run_dir": str(run_dir),
         "subgraphs": str(subgraphs_path),
         "kernels_summary": str(summary_path),
         "composition": comp_res,
     }
+    if enable_profiler:
+        profiler.emit(
+            {
+                "event_type": "stage",
+                "stage_name": "compose",
+                "local_exec_start_ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(compose_t0)),
+                "local_exec_end_ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(compose_t1)),
+                "local_exec_latency_ms": round((compose_t1 - compose_t0) * 1000.0, 3),
+                "compose_latency_ms": round((compose_t1 - compose_t0) * 1000.0, 3),
+                "success": bool(comp_res.get("success")),
+                "error_type": None if comp_res.get("success") else comp_res.get("verify_reason"),
+            }
+        )
+        try:
+            with Path(subgraphs_path).open("r", encoding="utf-8") as f:
+                sg = json.load(f)
+            n_subgraphs = len(sg) if isinstance(sg, list) else None
+        except Exception:
+            n_subgraphs = None
+        pipeline_t1 = time.time()
+        profiler.emit(
+            {
+                "event_type": "run_summary",
+                "stage_name": "pipeline.total",
+                "local_exec_start_ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(pipeline_t0)),
+                "local_exec_end_ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(pipeline_t1)),
+                "local_exec_latency_ms": round((pipeline_t1 - pipeline_t0) * 1000.0, 3),
+                "number_of_subgraphs": n_subgraphs,
+                "number_of_workers": workers,
+                "final_status": "success" if comp_res.get("success") else "failed",
+                "final_output_path": comp_res.get("composed_path"),
+                "success": bool(comp_res.get("success")),
+            }
+        )
+        summary = profiler.finalize(
+            {
+                "final_status": "success" if comp_res.get("success") else "failed",
+                "final_output_path": comp_res.get("composed_path"),
+            }
+        )
+        if profiler.paths is not None:
+            result["profiling"] = {
+                "events": str(profiler.paths.events_path),
+                "summary": str(profiler.paths.summary_path),
+                "csv": str(profiler.paths.csv_path) if profile_export_csv else None,
+                "aggregate": summary,
+            }
+
+    return result
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -176,6 +274,13 @@ def main(argv: list[str] | None = None) -> int:
         help="Target platform",
     )
     p.add_argument("--test-timeout-s", type=int, default=30)
+    p.add_argument("--enable-profiler", action="store_true")
+    p.add_argument(
+        "--profile-output-dir",
+        default=None,
+        help="Optional profiler output dir (default: .fuse/<run_id>/profiling)",
+    )
+    p.add_argument("--profile-export-csv", action="store_true")
     args = p.parse_args(argv)
 
     problem_path = Path(args.problem).resolve()
@@ -198,7 +303,12 @@ def main(argv: list[str] | None = None) -> int:
             verify=args.verify,
             compose_max_iters=args.compose_max_iters,
             target_platform=args.target_platform,
-            test_timeout_s=args.run_timeout_s,
+            test_timeout_s=args.test_timeout_s,
+            enable_profiler=args.enable_profiler,
+            profile_output_dir=Path(args.profile_output_dir).resolve()
+            if args.profile_output_dir
+            else None,
+            profile_export_csv=args.profile_export_csv,
         )
         print(json.dumps(res, indent=2))
         return 0

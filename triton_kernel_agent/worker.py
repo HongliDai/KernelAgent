@@ -21,6 +21,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -29,6 +30,7 @@ from typing import Any
 from triton_kernel_agent.platform_config import get_platform
 from triton_kernel_agent.worker_util import format_test_code_for_llm
 from utils.providers import get_model_provider
+from Fuser.lightweight_profiler import get_profiler_from_env, extract_usage_tokens
 
 from .prompt_manager import PromptManager
 from .worker_util import _run_test_multiprocess
@@ -302,13 +304,17 @@ class VerificationWorker:
                 return message
         return None
 
-    def _run_test(self) -> tuple[bool, str, str]:
+    def _run_test(self) -> tuple[bool, str, str, dict[str, Any]]:
         """
         Run all test scripts sequentially (``&&`` semantics).
 
         Returns:
-            Tuple of (success, stdout, stderr)
+            Tuple of (success, stdout, stderr, exec_meta)
         """
+        t0 = time.time()
+        start_iso = datetime.utcfromtimestamp(t0).isoformat() + "Z"
+        exit_code: int | None = None
+        timeout_flag = False
         try:
             for test_file in self.test_files:
                 if not test_file.exists():
@@ -320,6 +326,7 @@ class VerificationWorker:
                     text=True,
                     timeout=self.test_timeout_s,
                 )
+                exit_code = result.returncode
                 if result.returncode != 0:
                     self.logger.error(
                         "Test %s failed. Exit code: %s, stderr: %s",
@@ -327,21 +334,56 @@ class VerificationWorker:
                         result.returncode,
                         result.stderr[:2000],
                     )
-                    return False, result.stdout, result.stderr
+                    t1 = time.time()
+                    meta = {
+                        "local_exec_start_ts": start_iso,
+                        "local_exec_end_ts": datetime.utcfromtimestamp(t1).isoformat()
+                        + "Z",
+                        "local_exec_latency_ms": round((t1 - t0) * 1000.0, 3),
+                        "subprocess_exit_code": exit_code,
+                        "timeout_flag": False,
+                    }
+                    return False, result.stdout, result.stderr, meta
                 self.logger.info("Test %s passed", test_file.name)
 
-            return True, result.stdout, result.stderr
+            t1 = time.time()
+            meta = {
+                "local_exec_start_ts": start_iso,
+                "local_exec_end_ts": datetime.utcfromtimestamp(t1).isoformat() + "Z",
+                "local_exec_latency_ms": round((t1 - t0) * 1000.0, 3),
+                "subprocess_exit_code": exit_code,
+                "timeout_flag": False,
+            }
+            return True, result.stdout, result.stderr, meta
 
         except subprocess.TimeoutExpired:
             self.logger.error("Test timed out")
+            timeout_flag = True
+            t1 = time.time()
+            meta = {
+                "local_exec_start_ts": start_iso,
+                "local_exec_end_ts": datetime.utcfromtimestamp(t1).isoformat() + "Z",
+                "local_exec_latency_ms": round((t1 - t0) * 1000.0, 3),
+                "subprocess_exit_code": exit_code,
+                "timeout_flag": timeout_flag,
+            }
             return (
                 False,
                 "",
                 f"Test execution timed out after {self.test_timeout_s} seconds",
+                meta,
             )
         except Exception as e:
             self.logger.error(f"Test execution error: {e}")
-            return False, "", str(e)
+            t1 = time.time()
+            meta = {
+                "local_exec_start_ts": start_iso,
+                "local_exec_end_ts": datetime.utcfromtimestamp(t1).isoformat() + "Z",
+                "local_exec_latency_ms": round((t1 - t0) * 1000.0, 3),
+                "subprocess_exit_code": exit_code,
+                "timeout_flag": timeout_flag,
+            }
+            return False, "", str(e), meta
 
     def _call_llm(self, messages: list, **kwargs) -> str:
         """
@@ -406,7 +448,39 @@ class VerificationWorker:
 
                 # Call LLM API
                 messages = [{"role": "user", "content": prompt}]
-                response_text = self._call_llm(messages, max_tokens=20000)
+                profiler = get_profiler_from_env()
+                t0 = time.time()
+                req_start = datetime.utcfromtimestamp(t0).isoformat() + "Z"
+                response = self.provider.get_response(
+                    self.openai_model,
+                    messages,
+                    max_tokens=20000,
+                    high_reasoning_effort=self.high_reasoning_effort,
+                )
+                t1 = time.time()
+                req_end = datetime.utcfromtimestamp(t1).isoformat() + "Z"
+                p_tok, c_tok, t_tok = extract_usage_tokens(response.usage)
+                if profiler:
+                    profiler.emit(
+                        {
+                            "event_type": "llm_request",
+                            "stage_name": "dispatch.worker.refine",
+                            "worker_id": str(self.worker_id),
+                            "iteration_id": str(len(self.history) + 1),
+                            "model_name": self.openai_model,
+                            "request_start_ts": req_start,
+                            "request_end_ts": req_end,
+                            "llm_latency_ms": round((t1 - t0) * 1000.0, 3),
+                            "prompt_tokens": p_tok,
+                            "completion_tokens": c_tok,
+                            "total_tokens": t_tok,
+                            "success": True,
+                            "error_type": None,
+                            "provider_name": self.provider.name,
+                            "provider_supports_usage": response.usage is not None,
+                        }
+                    )
+                response_text = response.content
 
                 # Extract refined kernel from response
                 refined_kernel = self._extract_code_from_response(
@@ -425,6 +499,27 @@ class VerificationWorker:
                     return kernel_code
 
             except Exception as e:
+                profiler = get_profiler_from_env()
+                if profiler:
+                    profiler.emit(
+                        {
+                            "event_type": "llm_request",
+                            "stage_name": "dispatch.worker.refine",
+                            "worker_id": str(self.worker_id),
+                            "iteration_id": str(len(self.history) + 1),
+                            "model_name": self.openai_model,
+                            "request_start_ts": None,
+                            "request_end_ts": None,
+                            "llm_latency_ms": None,
+                            "prompt_tokens": None,
+                            "completion_tokens": None,
+                            "total_tokens": None,
+                            "success": False,
+                            "error_type": e.__class__.__name__,
+                            "provider_name": self.provider.name if self.provider else None,
+                            "provider_supports_usage": False,
+                        }
+                    )
                 self.logger.error(f"Error refining kernel with LLM API: {e}")
                 # Fall back to mock refinement
 
@@ -479,6 +574,7 @@ class VerificationWorker:
             Dictionary with results
         """
         self.logger.info(f"Starting verification for worker {self.worker_id}")
+        profiler = get_profiler_from_env()
         self._has_multiple_tests = len(test_code) > 1
 
         current_kernel = kernel_code
@@ -505,9 +601,27 @@ class VerificationWorker:
                 self._write_kernel(current_kernel)
 
             # Run verification (additional tests chained automatically by _run_test)
-            success, stdout, stderr, violation = self._single_verification_pass(
+            success, stdout, stderr, violation, verify_meta = self._single_verification_pass(
                 current_kernel
             )
+
+            if profiler:
+                profiler.emit(
+                    {
+                        "event_type": "local_exec",
+                        "stage_name": "dispatch.worker.verify",
+                        "worker_id": str(self.worker_id),
+                        "iteration_id": str(round_num + 1),
+                        "local_exec_start_ts": verify_meta.get("local_exec_start_ts"),
+                        "local_exec_end_ts": verify_meta.get("local_exec_end_ts"),
+                        "local_exec_latency_ms": verify_meta.get("local_exec_latency_ms"),
+                        "verify_latency_ms": verify_meta.get("local_exec_latency_ms"),
+                        "subprocess_exit_code": verify_meta.get("subprocess_exit_code"),
+                        "timeout_flag": verify_meta.get("timeout_flag"),
+                        "success": success and not bool(violation),
+                        "error_type": violation or (None if success else "verify_failed"),
+                    }
+                )
 
             if violation:
                 self._log_round(round_num + 1, False, current_kernel, "", violation)
@@ -565,7 +679,7 @@ class VerificationWorker:
 
     def _single_verification_pass(
         self, kernel_code: str
-    ) -> tuple[bool, str, str, str | None]:
+    ) -> tuple[bool, str, str, str | None, dict[str, Any]]:
         """
         Run a single verification pass on the kernel.
 
@@ -577,19 +691,40 @@ class VerificationWorker:
         if violation:
             message = f"Disallowed PyTorch usage detected: {violation}"
             self.logger.error(message)
-            return False, "", message, message
+            now_iso = datetime.utcnow().isoformat() + "Z"
+            return (
+                False,
+                "",
+                message,
+                message,
+                {
+                    "local_exec_start_ts": now_iso,
+                    "local_exec_end_ts": now_iso,
+                    "local_exec_latency_ms": 0.0,
+                    "subprocess_exit_code": None,
+                    "timeout_flag": False,
+                },
+            )
 
-        success, stdout, stderr = (
-            self._run_test()
-            if os.getenv("KA_PROCESS_USE_SYS_EXECUTABLE", "1") == "1"
-            else _run_test_multiprocess(
+        if os.getenv("KA_PROCESS_USE_SYS_EXECUTABLE", "1") == "1":
+            success, stdout, stderr, meta = self._run_test()
+        else:
+            success, stdout, stderr = _run_test_multiprocess(
                 self.logger,
                 self.workdir,
                 self.test_files,
             )
-        )
+            # Multiprocess helper does not return timing metadata yet.
+            now_iso = datetime.utcnow().isoformat() + "Z"
+            meta = {
+                "local_exec_start_ts": now_iso,
+                "local_exec_end_ts": now_iso,
+                "local_exec_latency_ms": None,
+                "subprocess_exit_code": None,
+                "timeout_flag": False,
+            }
 
-        return success, stdout, stderr, None
+        return success, stdout, stderr, None, meta
 
     def verify_with_refinement(
         self,
@@ -623,7 +758,7 @@ class VerificationWorker:
         self._write_files(current_kernel, test_code)
 
         # Initial verification (additional tests chained automatically by _run_test)
-        success, stdout, stderr, violation = self._single_verification_pass(
+        success, stdout, stderr, violation, _ = self._single_verification_pass(
             current_kernel
         )
 
@@ -662,7 +797,7 @@ class VerificationWorker:
 
             # Write and test refined kernel
             self._write_kernel(refined_kernel)
-            success, stdout, stderr, violation = self._single_verification_pass(
+            success, stdout, stderr, violation, _ = self._single_verification_pass(
                 refined_kernel
             )
 

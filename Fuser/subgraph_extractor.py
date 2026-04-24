@@ -37,6 +37,7 @@ import json
 import re
 import sys
 import tarfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +46,7 @@ from .config import OrchestratorConfig, new_run_id
 from .orchestrator import Orchestrator
 from .paths import ensure_abs_regular_file, make_run_dirs, PathSafetyError
 from .event_adapter import EventAdapter
+from .lightweight_profiler import LightweightProfiler, get_profiler_from_env, extract_usage_tokens
 from triton_kernel_agent.platform_config import get_platform_choices
 
 from utils.providers import get_model_provider
@@ -214,6 +216,7 @@ def extract_subgraphs_to_json(
     llm_timeout_s: int,
     run_timeout_s: int,
     target_platform: str = "cuda",
+    profiler: LightweightProfiler | None = None,
 ) -> tuple[Path, Path]:
     """Run Fuser to produce fused code, then use LLM to emit subgraphs JSON.
 
@@ -238,6 +241,10 @@ def extract_subgraphs_to_json(
     base_dir = Path.cwd() / ".fuse"
     base_dir.mkdir(exist_ok=True)
     dirs = make_run_dirs(base_dir, run_id)
+    active_profiler = profiler or get_profiler_from_env()
+    if active_profiler:
+        active_profiler.attach_run_dir(dirs["run_dir"])
+        active_profiler.export_env()
 
     orch = Orchestrator(
         cfg,
@@ -245,7 +252,24 @@ def extract_subgraphs_to_json(
         workers_dir=dirs["workers"],
         orchestrator_dir=dirs["orchestrator"],
     )
+    orch_t0 = time.time()
     summary = orch.run()
+    orch_t1 = time.time()
+    if active_profiler:
+        active_profiler.emit(
+            {
+                "event_type": "stage",
+                "stage_name": "extract",
+                "worker_id": None,
+                "iteration_id": None,
+                "local_exec_start_ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(orch_t0)),
+                "local_exec_end_ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(orch_t1)),
+                "local_exec_latency_ms": round((orch_t1 - orch_t0) * 1000.0, 3),
+                "success": summary.winner_worker_id is not None,
+                "error_type": None if summary.winner_worker_id is not None else summary.reason,
+                "number_of_workers": workers,
+            }
+        )
     if summary.winner_worker_id is None or not summary.artifact_path:
         raise SystemExit(f"No passing fused code: {summary.reason}")
 
@@ -268,12 +292,35 @@ def extract_subgraphs_to_json(
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ]
+        llm_t0 = time.time()
+        llm_start = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(llm_t0))
         result = provider.get_response(
             model_name,
             messages,
             max_tokens=16000,
             text={"format": {"type": "text"}},
         )
+        llm_t1 = time.time()
+        llm_end = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(llm_t1))
+        if active_profiler:
+            p_tok, c_tok, t_tok = extract_usage_tokens(result.usage)
+            active_profiler.emit(
+                {
+                    "event_type": "llm_request",
+                    "stage_name": "subgraph_extraction.llm",
+                    "model_name": model_name,
+                    "request_start_ts": llm_start,
+                    "request_end_ts": llm_end,
+                    "llm_latency_ms": round((llm_t1 - llm_t0) * 1000.0, 3),
+                    "prompt_tokens": p_tok,
+                    "completion_tokens": c_tok,
+                    "total_tokens": t_tok,
+                    "success": True,
+                    "error_type": None,
+                    "provider_name": provider.name,
+                    "provider_supports_usage": result.usage is not None,
+                }
+            )
         output_text = result.content or ""
     else:
         jsonl_path = dirs["orchestrator"] / "subgraphs.stream.jsonl"
@@ -283,11 +330,35 @@ def extract_subgraphs_to_json(
             timeout_s=llm_timeout_s,
             jsonl_path=jsonl_path,
         )
+        llm_t0 = time.time()
+        llm_start = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(llm_t0))
         result = adapter.stream(
             system_prompt=system,
             user_prompt=user,
             extras={"text": {"format": {"type": "text"}}},
         )
+        llm_t1 = time.time()
+        llm_end = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(llm_t1))
+        if active_profiler:
+            usage = result.get("usage") if isinstance(result, dict) else None
+            p_tok, c_tok, t_tok = extract_usage_tokens(usage if isinstance(usage, dict) else None)
+            active_profiler.emit(
+                {
+                    "event_type": "llm_request",
+                    "stage_name": "subgraph_extraction.llm",
+                    "model_name": model_name,
+                    "request_start_ts": llm_start,
+                    "request_end_ts": llm_end,
+                    "llm_latency_ms": round((llm_t1 - llm_t0) * 1000.0, 3),
+                    "prompt_tokens": p_tok,
+                    "completion_tokens": c_tok,
+                    "total_tokens": t_tok,
+                    "success": not bool(result.get("error")),
+                    "error_type": result.get("error"),
+                    "provider_name": "openai",
+                    "provider_supports_usage": usage is not None,
+                }
+            )
         output_text = result.get("output_text", "")
 
     raw_json = _extract_json_block(output_text)
@@ -365,6 +436,15 @@ def extract_subgraphs_to_json(
                 grouped[s]["count"] += 1
 
     deduped = list(grouped.values())
+    if active_profiler:
+        active_profiler.emit(
+            {
+                "event_type": "stage",
+                "stage_name": "subgraph_extraction",
+                "success": True,
+                "number_of_subgraphs": len(deduped),
+            }
+        )
     out_path = dirs["run_dir"] / "subgraphs.json"
     out_path.write_text(json.dumps(deduped, indent=2), encoding="utf-8")
     return dirs["run_dir"], out_path
