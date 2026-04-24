@@ -36,10 +36,20 @@ _DEF_EVENT_FIELDS = [
     "model_name",
     "request_start_ts",
     "request_end_ts",
+    "provider_request_id",
+    "provider_response_id",
     "llm_latency_ms",
     "prompt_tokens",
     "completion_tokens",
     "total_tokens",
+    "parent_llm_event_id",
+    "candidate_id",
+    "candidate_index",
+    "candidate_digest",
+    "candidate_count",
+    "deduped",
+    "duplicate_of",
+    "extraction_success",
     "success",
     "error_type",
     "local_exec_start_ts",
@@ -62,6 +72,10 @@ _DEF_EVENT_FIELDS = [
     "timestamp",
     "event_id",
 ]
+
+
+def new_event_id() -> str:
+    return uuid.uuid4().hex
 
 
 def _utc_now_iso() -> str:
@@ -202,22 +216,25 @@ class LightweightProfiler:
             self._write_jsonl_line(json.dumps(ev, ensure_ascii=False))
         self._pending_events.clear()
 
-    def emit(self, event: dict[str, Any]) -> None:
+    def emit(self, event: dict[str, Any]) -> str | None:
         if not self.enabled:
-            return
+            return None
+        event_id = str(event.get("event_id") or new_event_id())
         base = {
             "timestamp": _utc_now_iso(),
-            "event_id": uuid.uuid4().hex,
+            "event_id": event_id,
             "run_id": self.run_id,
             "problem_path": self.problem_path,
             "target_platform": self.target_platform,
         }
         base.update(event)
+        base["event_id"] = event_id
         with self._lock:
             if self._paths is None:
                 self._pending_events.append(base)
-                return
+                return event_id
             self._write_jsonl_line(json.dumps(base, ensure_ascii=False))
+        return event_id
 
     @contextmanager
     def stage_timer(
@@ -322,6 +339,11 @@ def build_summary(
     worker_latency: dict[str, float] = {}
     worker_tokens: dict[str, int] = {}
     retries_by_stage: dict[str, int] = {}
+    seen_provider_requests: set[tuple[Any, ...]] = set()
+    provider_total_tokens = 0
+    candidate_events: list[dict[str, Any]] = []
+    verified_candidate_keys: set[tuple[Any, ...]] = set()
+    passed_candidate_keys: set[tuple[Any, ...]] = set()
 
     num_subgraphs = None
     final_status = "unknown"
@@ -340,16 +362,34 @@ def build_summary(
                     worker_latency.get(worker, 0.0) + float(lat), 3
                 )
 
-        p = _safe_int(ev.get("prompt_tokens")) or 0
-        c = _safe_int(ev.get("completion_tokens")) or 0
-        t = _safe_int(ev.get("total_tokens")) or 0
-        if stage and (p or c or t):
-            tok = stage_tokens.setdefault(stage, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
-            tok["prompt_tokens"] += p
-            tok["completion_tokens"] += c
-            tok["total_tokens"] += t
-            if isinstance(worker, str):
-                worker_tokens[worker] = worker_tokens.get(worker, 0) + t
+        if ev.get("event_type") == "llm_request":
+            provider_key = _provider_request_key(ev)
+            if provider_key not in seen_provider_requests:
+                seen_provider_requests.add(provider_key)
+                p = _safe_int(ev.get("prompt_tokens")) or 0
+                c = _safe_int(ev.get("completion_tokens")) or 0
+                raw_total = _safe_int(ev.get("total_tokens"))
+                t = raw_total if raw_total is not None else p + c
+                provider_total_tokens += t
+                if stage and (p or c or t):
+                    tok = stage_tokens.setdefault(
+                        stage,
+                        {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                    )
+                    tok["prompt_tokens"] += p
+                    tok["completion_tokens"] += c
+                    tok["total_tokens"] += t
+                    if isinstance(worker, str):
+                        worker_tokens[worker] = worker_tokens.get(worker, 0) + t
+
+        if ev.get("event_type") == "candidate_record":
+            candidate_events.append(ev)
+
+        if _is_candidate_verification_event(ev):
+            verify_key = _candidate_verify_key(ev)
+            verified_candidate_keys.add(verify_key)
+            if ev.get("success") is True:
+                passed_candidate_keys.add(verify_key)
 
         if isinstance(worker, str) and iteration is not None:
             worker_rounds.setdefault(worker, set()).add(str(iteration))
@@ -367,6 +407,12 @@ def build_summary(
 
     worker_slowest = sorted(worker_latency.items(), key=lambda x: x[1], reverse=True)[:3]
     worker_token_top = sorted(worker_tokens.items(), key=lambda x: x[1], reverse=True)[:3]
+    candidate_count, deduped_candidate_count = _candidate_counts(candidate_events)
+    verified_candidate_count = len(verified_candidate_keys)
+    passed_candidate_count = len(passed_candidate_keys)
+    if not candidate_events:
+        candidate_count = verified_candidate_count
+        deduped_candidate_count = verified_candidate_count
 
     return {
         "run_id": run_id,
@@ -379,6 +425,11 @@ def build_summary(
         "final_output_path": final_output_path,
         "stage_total_latency_ms": stage_time_ms,
         "stage_total_tokens": stage_tokens,
+        "provider_total_tokens": provider_total_tokens,
+        "candidate_count": candidate_count,
+        "deduped_candidate_count": deduped_candidate_count,
+        "verified_candidate_count": verified_candidate_count,
+        "passed_candidate_count": passed_candidate_count,
         "slowest_workers_top3": [
             {"worker_id": wid, "total_latency_ms": lat} for wid, lat in worker_slowest
         ],
@@ -388,6 +439,76 @@ def build_summary(
         "retries_by_stage": retries_by_stage,
         "event_count": len(events),
     }
+
+
+def _provider_request_key(ev: dict[str, Any]) -> tuple[Any, ...]:
+    explicit = ev.get("provider_request_id") or ev.get("provider_response_id")
+    if explicit:
+        return ("provider_request_id", explicit)
+    return (
+        "legacy_request",
+        ev.get("stage_name"),
+        ev.get("worker_id"),
+        ev.get("model_name"),
+        ev.get("provider_name"),
+        ev.get("request_start_ts"),
+        ev.get("request_end_ts"),
+        ev.get("llm_latency_ms"),
+        ev.get("prompt_tokens"),
+        ev.get("completion_tokens"),
+        ev.get("total_tokens"),
+    )
+
+
+def _candidate_key(ev: dict[str, Any]) -> tuple[Any, ...]:
+    candidate_id = ev.get("candidate_id")
+    if candidate_id is not None:
+        return ("candidate_id", candidate_id)
+    return (
+        "candidate_event",
+        ev.get("stage_name"),
+        ev.get("worker_id"),
+        ev.get("iteration_id"),
+        ev.get("candidate_index"),
+        ev.get("event_id"),
+    )
+
+
+def _candidate_counts(candidate_events: list[dict[str, Any]]) -> tuple[int, int]:
+    candidate_keys: set[tuple[Any, ...]] = set()
+    deduped_keys: set[tuple[Any, ...]] = set()
+    for ev in candidate_events:
+        candidate_keys.add(_candidate_key(ev))
+        if ev.get("deduped") is False or ev.get("duplicate_of"):
+            continue
+        if ev.get("success") is False or ev.get("extraction_success") is False:
+            continue
+        digest = ev.get("candidate_digest")
+        if digest:
+            deduped_keys.add(("digest", digest))
+        else:
+            deduped_keys.add(_candidate_key(ev))
+    return len(candidate_keys), len(deduped_keys)
+
+
+def _is_candidate_verification_event(ev: dict[str, Any]) -> bool:
+    if ev.get("event_type") != "local_exec":
+        return False
+    stage = str(ev.get("stage_name") or "")
+    return ev.get("verify_latency_ms") is not None or "verify" in stage
+
+
+def _candidate_verify_key(ev: dict[str, Any]) -> tuple[Any, ...]:
+    candidate_id = ev.get("candidate_id")
+    if candidate_id is not None:
+        return ("candidate_id", candidate_id)
+    return (
+        "verify",
+        ev.get("stage_name"),
+        ev.get("worker_id"),
+        ev.get("iteration_id"),
+        ev.get("event_id"),
+    )
 
 
 def _stage_iteration_counter(events: list[dict[str, Any]]) -> dict[str, int]:

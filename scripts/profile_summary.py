@@ -51,7 +51,15 @@ def main(argv: list[str] | None = None) -> int:
     retry_stages = sorted(
         summary.get("retries_by_stage", {}).items(), key=lambda x: x[1], reverse=True
     )
+    candidate_rows = [
+        ("provider_total_tokens", int(summary.get("provider_total_tokens", 0))),
+        ("candidate_count", int(summary.get("candidate_count", 0))),
+        ("deduped_candidate_count", int(summary.get("deduped_candidate_count", 0))),
+        ("verified_candidate_count", int(summary.get("verified_candidate_count", 0))),
+        ("passed_candidate_count", int(summary.get("passed_candidate_count", 0))),
+    ]
 
+    _print_table("Provider / candidate 汇总:", candidate_rows)
     _print_table("每个阶段总耗时(ms):", [(k, round(v, 3)) for k, v in stage_latency])
     _print_table("每个阶段总 tokens:", stage_tokens)
     _print_table("最慢的 3 个 worker:", slowest_workers)

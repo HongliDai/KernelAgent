@@ -29,7 +29,12 @@ from .prompt_manager import PromptManager
 from utils.providers import BaseProvider, get_model_provider
 from triton_kernel_agent.platform_config import PlatformConfig, get_platform
 from triton_kernel_agent.worker_util import format_test_code_for_llm
-from Fuser.lightweight_profiler import get_profiler_from_env, extract_usage_tokens
+from Fuser.code_extractor import sha256_of_code
+from Fuser.lightweight_profiler import (
+    extract_usage_tokens,
+    get_profiler_from_env,
+    new_event_id,
+)
 
 
 class TritonKernelAgent:
@@ -409,6 +414,7 @@ if __name__ == "__main__":
                     # Provider supports native multiple completions
                     t0 = time.time()
                     req_start = datetime.utcfromtimestamp(t0).isoformat() + "Z"
+                    llm_event_id = new_event_id()
                     responses = self.provider.get_multiple_responses(
                         self.model_name,
                         messages,
@@ -421,45 +427,83 @@ if __name__ == "__main__":
                     req_end = datetime.utcfromtimestamp(t1).isoformat() + "Z"
                     profiler = get_profiler_from_env()
                     if profiler:
-                        for i, response in enumerate(responses, start=1):
-                            p_tok, c_tok, t_tok = extract_usage_tokens(response.usage)
-                            profiler.emit(
-                                {
-                                    "event_type": "llm_request",
-                                    "stage_name": "dispatch.seed_generation",
-                                    "worker_id": None,
-                                    "iteration_id": str(i),
-                                    "model_name": self.model_name,
-                                    "request_start_ts": req_start,
-                                    "request_end_ts": req_end,
-                                    "llm_latency_ms": round((t1 - t0) * 1000.0, 3),
-                                    "prompt_tokens": p_tok,
-                                    "completion_tokens": c_tok,
-                                    "total_tokens": t_tok,
-                                    "success": True,
-                                    "error_type": None,
-                                    "provider_name": self.provider.name,
-                                    "provider_supports_usage": response.usage is not None,
-                                }
-                            )
+                        usage = responses[0].usage if responses else None
+                        p_tok, c_tok, t_tok = extract_usage_tokens(usage)
+                        profiler.emit(
+                            {
+                                "event_id": llm_event_id,
+                                "provider_request_id": llm_event_id,
+                                "event_type": "llm_request",
+                                "stage_name": "dispatch.seed_generation",
+                                "worker_id": None,
+                                "iteration_id": None,
+                                "model_name": self.model_name,
+                                "request_start_ts": req_start,
+                                "request_end_ts": req_end,
+                                "llm_latency_ms": round((t1 - t0) * 1000.0, 3),
+                                "prompt_tokens": p_tok,
+                                "completion_tokens": c_tok,
+                                "total_tokens": t_tok,
+                                "success": True,
+                                "error_type": None,
+                                "provider_name": self.provider.name,
+                                "provider_supports_usage": usage is not None,
+                                "candidate_count": len(responses),
+                            }
+                        )
 
+                    seen_digests: set[str] = set()
                     for i, response in enumerate(responses):
                         kernel_code = self._extract_code_from_response(
                             response.content,
                             prefer_kernel_function=self._has_multiple_tests,
                         )
                         if kernel_code:
+                            digest = sha256_of_code(kernel_code)
+                            deduped = digest not in seen_digests
+                            seen_digests.add(digest)
                             kernels.append(kernel_code)
+                            if profiler:
+                                profiler.emit(
+                                    {
+                                        "event_type": "candidate_record",
+                                        "stage_name": "dispatch.seed_generation",
+                                        "parent_llm_event_id": llm_event_id,
+                                        "candidate_id": f"seed:{i + 1}",
+                                        "candidate_index": i + 1,
+                                        "candidate_digest": digest,
+                                        "deduped": deduped,
+                                        "duplicate_of": None if deduped else digest,
+                                        "extraction_success": True,
+                                        "success": True,
+                                    }
+                                )
                         else:
                             self.logger.warning(
                                 f"Failed to extract code from kernel seed {i}"
                             )
+                            if profiler:
+                                profiler.emit(
+                                    {
+                                        "event_type": "candidate_record",
+                                        "stage_name": "dispatch.seed_generation",
+                                        "parent_llm_event_id": llm_event_id,
+                                        "candidate_id": f"seed:{i + 1}",
+                                        "candidate_index": i + 1,
+                                        "deduped": False,
+                                        "extraction_success": False,
+                                        "success": False,
+                                        "error_type": "extract_failed",
+                                    }
+                                )
                 else:
                     # Provider doesn't support multiple completions, make individual calls
+                    seen_digests: set[str] = set()
                     for i in range(num_seeds):
                         profiler = get_profiler_from_env()
                         t0 = time.time()
                         req_start = datetime.utcfromtimestamp(t0).isoformat() + "Z"
+                        llm_event_id = new_event_id()
                         response = self.provider.get_response(
                             self.model_name,
                             messages,
@@ -473,6 +517,8 @@ if __name__ == "__main__":
                         if profiler:
                             profiler.emit(
                                 {
+                                    "event_id": llm_event_id,
+                                    "provider_request_id": llm_event_id,
                                     "event_type": "llm_request",
                                     "stage_name": "dispatch.seed_generation",
                                     "worker_id": None,
@@ -497,11 +543,43 @@ if __name__ == "__main__":
                         )
 
                         if kernel_code:
+                            digest = sha256_of_code(kernel_code)
+                            deduped = digest not in seen_digests
+                            seen_digests.add(digest)
                             kernels.append(kernel_code)
+                            if profiler:
+                                profiler.emit(
+                                    {
+                                        "event_type": "candidate_record",
+                                        "stage_name": "dispatch.seed_generation",
+                                        "parent_llm_event_id": llm_event_id,
+                                        "candidate_id": f"seed:{i + 1}",
+                                        "candidate_index": i + 1,
+                                        "candidate_digest": digest,
+                                        "deduped": deduped,
+                                        "duplicate_of": None if deduped else digest,
+                                        "extraction_success": True,
+                                        "success": True,
+                                    }
+                                )
                         else:
                             self.logger.warning(
                                 f"Failed to extract code from kernel seed {i}"
                             )
+                            if profiler:
+                                profiler.emit(
+                                    {
+                                        "event_type": "candidate_record",
+                                        "stage_name": "dispatch.seed_generation",
+                                        "parent_llm_event_id": llm_event_id,
+                                        "candidate_id": f"seed:{i + 1}",
+                                        "candidate_index": i + 1,
+                                        "deduped": False,
+                                        "extraction_success": False,
+                                        "success": False,
+                                        "error_type": "extract_failed",
+                                    }
+                                )
 
                 if kernels:
                     self.logger.info(
